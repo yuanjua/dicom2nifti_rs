@@ -47,6 +47,8 @@ struct DicomSliceInfo {
     subvol_label: String,
     acquisition_number: i32,
     echo_number: i32,
+    instance_number: i32,
+    image_type: String,
     // TCGA-style metadata
     patient_id: String,
     patient_name: String,
@@ -112,6 +114,19 @@ fn read_dicom_header(path: &Path, input_root: &Path) -> Result<DicomSliceInfo> {
 
     let (subvol_key, subvol_label) = determine_subvolume(&obj);
     let acquisition_number = get_i32(&obj, Tag(0x0020, 0x0012)).unwrap_or(0);
+    let instance_number = get_i32(&obj, Tag(0x0020, 0x0013)).unwrap_or(0);
+
+    // ImageType (0008,0008) — extract 3rd component (e.g. "W", "IP", "OP", "F")
+    let image_type = get_string(&obj, Tag(0x0008, 0x0008))
+        .map(|s| {
+            let parts: Vec<&str> = s.split('\\').collect();
+            if parts.len() >= 3 {
+                parts[2].trim().to_string()
+            } else {
+                String::new()
+            }
+        })
+        .unwrap_or_default();
 
     // TCGA-style metadata
     let patient_id = get_string(&obj, Tag(0x0010, 0x0020)).unwrap_or_default();
@@ -149,6 +164,8 @@ fn read_dicom_header(path: &Path, input_root: &Path) -> Result<DicomSliceInfo> {
         subvol_label,
         acquisition_number,
         echo_number,
+        instance_number,
+        image_type,
         patient_id,
         patient_name,
         study_instance_uid,
@@ -683,6 +700,82 @@ fn main() -> Result<()> {
                         final_groups.insert(name, sub_slices);
                     }
                     continue;
+                }
+            }
+
+            // Strategy 4: ImageType splitting (mDIXON-All: W/IP/OP/F)
+            // If multiple distinct non-empty ImageType values exist, split by them
+            let distinct_img_types: std::collections::HashSet<&str> = slices
+                .iter()
+                .filter(|s| !s.image_type.is_empty())
+                .map(|s| s.image_type.as_str())
+                .collect();
+            if distinct_img_types.len() > 1 {
+                let mut sub_groups: HashMap<String, Vec<DicomSliceInfo>> = HashMap::new();
+                for s in slices {
+                    let key = if s.image_type.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        s.image_type.clone()
+                    };
+                    sub_groups.entry(key).or_default().push(s);
+                }
+                for (img_type, mut sub_slices) in sub_groups {
+                    let label = img_type.to_lowercase();
+                    for s in &mut sub_slices {
+                        s.subvol_label = label.clone();
+                    }
+                    let name = format!("{}_{}", group_name, label);
+                    final_groups.insert(name, sub_slices);
+                }
+                continue;
+            }
+
+            // Strategy 5: Repeated-position phase splitting (UIH DCE dynamic series)
+            // When no TemporalPositionIdentifier or AcquisitionNumber is available,
+            // detect repeated slice locations and split by InstanceNumber-based phases.
+            if slices.len() > 3 {
+                let normal = slices[0].slice_info.slice_normal();
+                // Quantize positions to 0.1mm to group identical locations
+                let quantize = |v: f64| -> i64 { (v * 10.0).round() as i64 };
+                let unique_positions: std::collections::HashSet<i64> = slices
+                    .iter()
+                    .map(|s| quantize(s.slice_info.dot_normal(&normal)))
+                    .collect();
+                let n_unique = unique_positions.len();
+                let n_total = slices.len();
+                // Check: each position should repeat the same number of times,
+                // and there must be more than 1 repetition (i.e. multiple phases)
+                if n_unique > 1 && n_total > n_unique && n_total % n_unique == 0 {
+                    let n_phases = n_total / n_unique;
+                    if n_phases > 1 && n_phases <= 200 {
+                        // Verify: count repetitions per position
+                        let mut pos_counts: HashMap<i64, usize> = HashMap::new();
+                        for s in &slices {
+                            *pos_counts
+                                .entry(quantize(s.slice_info.dot_normal(&normal)))
+                                .or_default() += 1;
+                        }
+                        let all_same_count = pos_counts.values().all(|&c| c == n_phases);
+
+                        if all_same_count {
+                            // Sort by InstanceNumber and split into n_phases groups
+                            slices.sort_by_key(|s| s.instance_number);
+                            for phase in 0..n_phases {
+                                let start = phase * n_unique;
+                                let end = start + n_unique;
+                                let mut sub: Vec<DicomSliceInfo> =
+                                    slices[start..end].to_vec();
+                                let label = format!("phase{}", phase + 1);
+                                for s in &mut sub {
+                                    s.subvol_label = label.clone();
+                                }
+                                let name = format!("{}_phase{}", group_name, phase + 1);
+                                final_groups.insert(name, sub);
+                            }
+                            continue;
+                        }
+                    }
                 }
             }
         }
