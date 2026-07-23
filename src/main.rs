@@ -49,6 +49,14 @@ struct DicomSliceInfo {
     echo_number: i32,
     instance_number: i32,
     image_type: String,
+    is_derived: bool,
+    is_phase: bool,
+    is_real: bool,
+    is_imaginary: bool,
+    is_magnitude: bool,
+    content_time: f64,
+    trigger_delay_time: f64,
+    rows_cols_key: u64,
     // TCGA-style metadata
     patient_id: String,
     patient_name: String,
@@ -116,17 +124,44 @@ fn read_dicom_header(path: &Path, input_root: &Path) -> Result<DicomSliceInfo> {
     let acquisition_number = get_i32(&obj, Tag(0x0020, 0x0012)).unwrap_or(0);
     let instance_number = get_i32(&obj, Tag(0x0020, 0x0013)).unwrap_or(0);
 
-    // ImageType (0008,0008) — extract 3rd component (e.g. "W", "IP", "OP", "F")
-    let image_type = get_string(&obj, Tag(0x0008, 0x0008))
-        .map(|s| {
-            let parts: Vec<&str> = s.split('\\').collect();
-            if parts.len() >= 3 {
-                parts[2].trim().to_string()
-            } else {
-                String::new()
-            }
-        })
-        .unwrap_or_default();
+    // ImageType (0008,0008) — full parsing for derived/phase/real/imaginary/magnitude detection
+    let image_type_raw = get_string(&obj, Tag(0x0008, 0x0008)).unwrap_or_default();
+    let image_type_upper = image_type_raw.to_uppercase();
+    let is_derived = image_type_upper.contains("DERIVED");
+    let is_phase = image_type_upper.contains("_P_")
+        || image_type_upper.contains("\\P\\")
+        || image_type_upper.contains("PHASE");
+    let is_real = image_type_upper.contains("_R_")
+        || image_type_upper.contains("\\R\\")
+        || image_type_upper.contains("_REAL_");
+    let is_imaginary = image_type_upper.contains("_I_")
+        || image_type_upper.contains("\\I\\")
+        || image_type_upper.contains("_IMAGINARY_");
+    let is_magnitude = image_type_upper.contains("_M_")
+        || image_type_upper.contains("\\M\\")
+        || image_type_upper.contains("_MAGNITUDE_");
+    // Extract 3rd component for mDIXON (W/IP/OP/F)
+    let image_type = {
+        let parts: Vec<&str> = image_type_raw.split('\\').collect();
+        if parts.len() >= 3 {
+            parts[2].trim().to_string()
+        } else {
+            String::new()
+        }
+    };
+
+    // ContentTime (0008,0033) — for time-based phase grouping
+    let content_time = get_string(&obj, Tag(0x0008, 0x0033))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(0.0);
+
+    // TriggerDelayTime (0020,9153) or TriggerTime (0018,1060)
+    let trigger_delay_time = get_f64(&obj, Tag(0x0020, 0x9153))
+        .or_else(|| get_f64(&obj, Tag(0x0018, 0x1060)))
+        .unwrap_or(0.0);
+
+    // Matrix size key for dimension consistency check
+    let rows_cols_key = ((rows as u64) << 16) | (cols as u64);
 
     // TCGA-style metadata
     let patient_id = get_string(&obj, Tag(0x0010, 0x0020)).unwrap_or_default();
@@ -166,6 +201,14 @@ fn read_dicom_header(path: &Path, input_root: &Path) -> Result<DicomSliceInfo> {
         echo_number,
         instance_number,
         image_type,
+        is_derived,
+        is_phase,
+        is_real,
+        is_imaginary,
+        is_magnitude,
+        content_time,
+        trigger_delay_time,
+        rows_cols_key,
         patient_id,
         patient_name,
         study_instance_uid,
@@ -574,6 +617,17 @@ fn main() -> Result<()> {
         n_errors
     );
 
+    // Phase 1.5: Pre-filter non-imaging slices
+    // Remove LOCALIZER images (dcm2niix: isLocalizer detection)
+    let headers: Vec<DicomSliceInfo> = headers
+        .into_iter()
+        .filter(|h| {
+            let it = h.image_type.to_uppercase();
+            // Keep everything that is not a LOCALIZER
+            it != "LOCALIZER"
+        })
+        .collect();
+
     // Phase 2: Group by series + subvolume
     let mut groups: HashMap<GroupKey, Vec<DicomSliceInfo>> = HashMap::new();
     for h in headers {
@@ -639,8 +693,95 @@ fn main() -> Result<()> {
         };
 
         // For groups with no subvolume differentiation, try splitting strategies
+        // Ranked by coverage frequency (most common split reasons first)
         if !has_multiple_subvols && slices.len() > 1 {
-            // Strategy 1: Multi-echo splitting (T2*, DIXON, multi-echo GRE)
+            // === STRATEGY 1: Dimension consistency (dcm2niix: isDimensionVaries) ===
+            // Slices with different matrix sizes MUST NOT be stacked together.
+            // This catches mixed-resolution series before any other logic.
+            let distinct_dims: std::collections::HashSet<u64> =
+                slices.iter().map(|s| s.rows_cols_key).collect();
+            if distinct_dims.len() > 1 {
+                let mut sub_groups: HashMap<u64, Vec<DicomSliceInfo>> = HashMap::new();
+                for s in slices {
+                    sub_groups.entry(s.rows_cols_key).or_default().push(s);
+                }
+                for (dim_idx, (_dim, mut sub_slices)) in sub_groups.into_iter().enumerate() {
+                    let label = format!("dim{dim_idx}");
+                    for s in &mut sub_slices {
+                        s.subvol_label = label.clone();
+                    }
+                    let name = format!("{}_dim{}", group_name, dim_idx);
+                    final_groups.insert(name, sub_slices);
+                }
+                continue;
+            }
+
+            // === STRATEGY 2: Derived vs Original (dcm2niix: isDerived) ===
+            // Do not stack DERIVED and ORIGINAL images together.
+            // Catches ADC, TRACEW, FA maps mixed with source DWI.
+            let has_derived = slices.iter().any(|s| s.is_derived);
+            let has_original = slices.iter().any(|s| !s.is_derived);
+            if has_derived && has_original {
+                let mut sub_groups: HashMap<bool, Vec<DicomSliceInfo>> = HashMap::new();
+                for s in slices {
+                    sub_groups.entry(s.is_derived).or_default().push(s);
+                }
+                for (is_der, mut sub_slices) in sub_groups {
+                    let label = if is_der {
+                        "derived".to_string()
+                    } else {
+                        "original".to_string()
+                    };
+                    for s in &mut sub_slices {
+                        s.subvol_label = label.clone();
+                    }
+                    let name = format!("{}_{}", group_name, label);
+                    final_groups.insert(name, sub_slices);
+                }
+                continue;
+            }
+
+            // === STRATEGY 3: Phase/Real/Imaginary/Magnitude splitting ===
+            // (dcm2niix: isHasPhase/isHasReal/isHasImaginary; dicom2nifti: ImageType checks)
+            // Complex-valued series produce multiple image types in same series.
+            let has_multi_complex = {
+                let n_types = [
+                    slices.iter().any(|s| s.is_phase),
+                    slices.iter().any(|s| s.is_real),
+                    slices.iter().any(|s| s.is_imaginary),
+                    slices.iter().any(|s| s.is_magnitude),
+                ]
+                .iter()
+                .filter(|&&v| v)
+                .count();
+                n_types > 1
+            };
+            if has_multi_complex {
+                let mut sub_groups: HashMap<String, Vec<DicomSliceInfo>> = HashMap::new();
+                for s in slices {
+                    let label = if s.is_phase {
+                        "ph".to_string()
+                    } else if s.is_real {
+                        "real".to_string()
+                    } else if s.is_imaginary {
+                        "imaginary".to_string()
+                    } else {
+                        "mag".to_string()
+                    };
+                    sub_groups.entry(label).or_default().push(s);
+                }
+                for (label, mut sub_slices) in sub_groups {
+                    for s in &mut sub_slices {
+                        s.subvol_label = label.clone();
+                    }
+                    let name = format!("{}_{}", group_name, label);
+                    final_groups.insert(name, sub_slices);
+                }
+                continue;
+            }
+
+            // === STRATEGY 4: Multi-echo splitting (T2*, DIXON, multi-echo GRE) ===
+            // (dcm2niix: echoNum/TE varies → separate; dicom2nifti: not handled)
             let distinct_echos: std::collections::HashSet<i32> =
                 slices.iter().map(|s| s.echo_number).collect();
             if distinct_echos.len() > 1 {
@@ -658,53 +799,8 @@ fn main() -> Result<()> {
                 continue;
             }
 
-            // Strategy 2: AcquisitionNumber splitting (multiple distinct, fewer than total)
-            let distinct_acq: std::collections::HashSet<i32> =
-                slices.iter().map(|s| s.acquisition_number).collect();
-            if distinct_acq.len() > 1 && distinct_acq.len() < slices.len() {
-                let mut sub_groups: HashMap<i32, Vec<DicomSliceInfo>> = HashMap::new();
-                for s in slices {
-                    sub_groups.entry(s.acquisition_number).or_default().push(s);
-                }
-                for (acq, mut sub_slices) in sub_groups {
-                    for s in &mut sub_slices {
-                        s.subvol_label = format!("acq{acq}");
-                    }
-                    let name = format!("{}_acq{}", group_name, acq);
-                    final_groups.insert(name, sub_slices);
-                }
-                continue;
-            }
-
-            // Strategy 3: Same-position stacking (CEST, localizers with unique AcqNum per file)
-            if distinct_acq.len() > 1 && slices.len() > 2 {
-                let normal = slices[0].slice_info.slice_normal();
-                let positions: Vec<f64> = slices
-                    .iter()
-                    .map(|s| s.slice_info.dot_normal(&normal))
-                    .collect();
-                let pos_min = positions.iter().cloned().fold(f64::INFINITY, f64::min);
-                let pos_max = positions.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let pos_range = (pos_max - pos_min).abs();
-                let slice_thick = slices[0].slice_info.slice_thickness;
-                if pos_range < slice_thick.max(1.0) {
-                    let mut sub_groups: HashMap<i32, Vec<DicomSliceInfo>> = HashMap::new();
-                    for s in slices {
-                        sub_groups.entry(s.acquisition_number).or_default().push(s);
-                    }
-                    for (acq, mut sub_slices) in sub_groups {
-                        for s in &mut sub_slices {
-                            s.subvol_label = format!("acq{acq}");
-                        }
-                        let name = format!("{}_acq{}", group_name, acq);
-                        final_groups.insert(name, sub_slices);
-                    }
-                    continue;
-                }
-            }
-
-            // Strategy 4: ImageType splitting (mDIXON-All: W/IP/OP/F)
-            // If multiple distinct non-empty ImageType values exist, split by them
+            // === STRATEGY 5: ImageType splitting (mDIXON-All: W/IP/OP/F) ===
+            // (dcm2niix: handles via imageType text; dicom2nifti: filters LOCALIZER by ImageType)
             let distinct_img_types: std::collections::HashSet<&str> = slices
                 .iter()
                 .filter(|s| !s.image_type.is_empty())
@@ -731,12 +827,86 @@ fn main() -> Result<()> {
                 continue;
             }
 
-            // Strategy 5: Repeated-position phase splitting (UIH DCE dynamic series)
+            // === STRATEGY 6: AcquisitionNumber splitting ===
+            // (dcm2niix: stacks by default but #mySegmentByAcq compile flag exists)
+            // (dicom2nifti Siemens: old code used AcqNum for classic 4D grouping)
+            let distinct_acq: std::collections::HashSet<i32> =
+                slices.iter().map(|s| s.acquisition_number).collect();
+            if distinct_acq.len() > 1 && distinct_acq.len() < slices.len() {
+                let mut sub_groups: HashMap<i32, Vec<DicomSliceInfo>> = HashMap::new();
+                for s in slices {
+                    sub_groups.entry(s.acquisition_number).or_default().push(s);
+                }
+                for (acq, mut sub_slices) in sub_groups {
+                    for s in &mut sub_slices {
+                        s.subvol_label = format!("acq{acq}");
+                    }
+                    let name = format!("{}_acq{}", group_name, acq);
+                    final_groups.insert(name, sub_slices);
+                }
+                continue;
+            }
+
+            // === STRATEGY 7: Same-position stacking (CEST, localizers) ===
+            // When all slices are at essentially the same spatial position but
+            // have distinct AcquisitionNumbers — split by AcqNum.
+            if distinct_acq.len() > 1 && slices.len() > 2 {
+                let normal = slices[0].slice_info.slice_normal();
+                let positions: Vec<f64> = slices
+                    .iter()
+                    .map(|s| s.slice_info.dot_normal(&normal))
+                    .collect();
+                let pos_min = positions.iter().cloned().fold(f64::INFINITY, f64::min);
+                let pos_max = positions.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let pos_range = (pos_max - pos_min).abs();
+                let slice_thick = slices[0].slice_info.slice_thickness;
+                if pos_range < slice_thick.max(1.0) {
+                    let mut sub_groups: HashMap<i32, Vec<DicomSliceInfo>> = HashMap::new();
+                    for s in slices {
+                        sub_groups.entry(s.acquisition_number).or_default().push(s);
+                    }
+                    for (acq, mut sub_slices) in sub_groups {
+                        for s in &mut sub_slices {
+                            s.subvol_label = format!("acq{acq}");
+                        }
+                        let name = format!("{}_acq{}", group_name, acq);
+                        final_groups.insert(name, sub_slices);
+                    }
+                    continue;
+                }
+            }
+
+            // === STRATEGY 8: TriggerDelayTime splitting (Philips cardiac) ===
+            // (dcm2niix: triggerDelayTime varies → not stacked for Philips non-ASL)
+            let distinct_triggers: std::collections::HashSet<i64> = slices
+                .iter()
+                .map(|s| (s.trigger_delay_time * 100.0).round() as i64)
+                .collect();
+            if distinct_triggers.len() > 1 && distinct_triggers.len() < slices.len() {
+                let mut sub_groups: HashMap<i64, Vec<DicomSliceInfo>> = HashMap::new();
+                for s in slices {
+                    let key = (s.trigger_delay_time * 100.0).round() as i64;
+                    sub_groups.entry(key).or_default().push(s);
+                }
+                for (trig_idx, (_trig, mut sub_slices)) in
+                    sub_groups.into_iter().enumerate()
+                {
+                    let label = format!("trig{trig_idx}");
+                    for s in &mut sub_slices {
+                        s.subvol_label = label.clone();
+                    }
+                    let name = format!("{}_trig{}", group_name, trig_idx);
+                    final_groups.insert(name, sub_slices);
+                }
+                continue;
+            }
+
+            // === STRATEGY 9: Repeated-position phase splitting (UIH DCE) ===
             // When no TemporalPositionIdentifier or AcquisitionNumber is available,
             // detect repeated slice locations and split by InstanceNumber-based phases.
+            // (dicom2nifti generic/siemens: uses position-direction reversal detection)
             if slices.len() > 3 {
                 let normal = slices[0].slice_info.slice_normal();
-                // Quantize positions to 0.1mm to group identical locations
                 let quantize = |v: f64| -> i64 { (v * 10.0).round() as i64 };
                 let unique_positions: std::collections::HashSet<i64> = slices
                     .iter()
@@ -744,22 +914,19 @@ fn main() -> Result<()> {
                     .collect();
                 let n_unique = unique_positions.len();
                 let n_total = slices.len();
-                // Check: each position should repeat the same number of times,
-                // and there must be more than 1 repetition (i.e. multiple phases)
                 if n_unique > 1 && n_total > n_unique && n_total % n_unique == 0 {
                     let n_phases = n_total / n_unique;
                     if n_phases > 1 && n_phases <= 200 {
-                        // Verify: count repetitions per position
                         let mut pos_counts: HashMap<i64, usize> = HashMap::new();
                         for s in &slices {
                             *pos_counts
                                 .entry(quantize(s.slice_info.dot_normal(&normal)))
                                 .or_default() += 1;
                         }
-                        let all_same_count = pos_counts.values().all(|&c| c == n_phases);
+                        let all_same_count =
+                            pos_counts.values().all(|&c| c == n_phases);
 
                         if all_same_count {
-                            // Sort by InstanceNumber and split into n_phases groups
                             slices.sort_by_key(|s| s.instance_number);
                             for phase in 0..n_phases {
                                 let start = phase * n_unique;
@@ -770,11 +937,77 @@ fn main() -> Result<()> {
                                 for s in &mut sub {
                                     s.subvol_label = label.clone();
                                 }
-                                let name = format!("{}_phase{}", group_name, phase + 1);
+                                let name =
+                                    format!("{}_phase{}", group_name, phase + 1);
                                 final_groups.insert(name, sub);
                             }
                             continue;
                         }
+                    }
+                }
+
+                // === STRATEGY 10: Direction-reversal detection ===
+                // (dicom2nifti: _classic_get_grouped_dicoms / get_grouped_dicoms)
+                // Sort by InstanceNumber, compute inter-slice direction vectors,
+                // and split when direction reverses (indicates new volume).
+                slices.sort_by_key(|s| s.instance_number);
+                let mut split_points: Vec<usize> = Vec::new();
+                if slices.len() >= 3 {
+                    let get_pos =
+                        |s: &DicomSliceInfo| -> [f64; 3] { s.slice_info.position };
+                    let mut prev_dir: Option<[f64; 3]> = None;
+                    for i in 1..slices.len() {
+                        let cur_pos = get_pos(&slices[i]);
+                        let prev_pos = get_pos(&slices[i - 1]);
+                        let diff = [
+                            cur_pos[0] - prev_pos[0],
+                            cur_pos[1] - prev_pos[1],
+                            cur_pos[2] - prev_pos[2],
+                        ];
+                        let norm = (diff[0].powi(2) + diff[1].powi(2) + diff[2].powi(2))
+                            .sqrt();
+                        if norm < 1e-6 {
+                            continue;
+                        }
+                        let dir = [diff[0] / norm, diff[1] / norm, diff[2] / norm];
+                        if let Some(pd) = prev_dir {
+                            let dot =
+                                pd[0] * dir[0] + pd[1] * dir[1] + pd[2] * dir[2];
+                            if dot < 0.95 {
+                                split_points.push(i);
+                                prev_dir = None;
+                                continue;
+                            }
+                        }
+                        prev_dir = Some(dir);
+                    }
+                }
+                if split_points.len() >= 1 {
+                    // Verify all resulting groups have the same size
+                    let mut boundaries: Vec<usize> = Vec::new();
+                    boundaries.push(0);
+                    boundaries.extend_from_slice(&split_points);
+                    boundaries.push(slices.len());
+                    let group_sizes: Vec<usize> = boundaries
+                        .windows(2)
+                        .map(|w| w[1] - w[0])
+                        .collect();
+                    let all_equal = group_sizes.iter().all(|&s| s == group_sizes[0]);
+                    if all_equal && group_sizes[0] >= 2 && group_sizes.len() > 1 {
+                        for (phase, window) in
+                            boundaries.windows(2).enumerate()
+                        {
+                            let mut sub: Vec<DicomSliceInfo> =
+                                slices[window[0]..window[1]].to_vec();
+                            let label = format!("phase{}", phase + 1);
+                            for s in &mut sub {
+                                s.subvol_label = label.clone();
+                            }
+                            let name =
+                                format!("{}_phase{}", group_name, phase + 1);
+                            final_groups.insert(name, sub);
+                        }
+                        continue;
                     }
                 }
             }
